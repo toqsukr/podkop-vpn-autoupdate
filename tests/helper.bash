@@ -2,7 +2,7 @@ fixture() {
 	dir=$(mktemp -d "$BATS_TEST_TMPDIR/router.XXXXXX")
 	mkdir -p "$dir/bin" "$dir/sub" "$dir/geo" "$dir/dns"
 	: >"$dir/secrets"
-	: >"$dir/uci"
+	printf "podkop_geo.location.name=usa\npodkop_geo.location.country=US\npodkop_geo.location.region=Texas\npodkop_geo.location.city=Dallas\n" >"$dir/uci"
 	echo 204 >"$dir/probe"
 	cat >"$dir/bin/curl" <<STUB
 #!/bin/sh
@@ -43,7 +43,7 @@ subscription() {
 
 server() {
 	echo "Address: $3" >"$1/dns/$2"
-	printf 'success\n%s\n%s\n' "$4" "$5" >"$1/geo/$3"
+	printf 'success\n%s\n%s\n%s\n' "$4" "$5" "$6" >"$1/geo/$3"
 }
 
 link() {
@@ -53,9 +53,15 @@ link() {
 tool() {
 	dir=$1
 	shift
-	PATH="$dir/bin:$PATH" PODKOP_DALLAS_SECRETS="$dir/secrets" PODKOP_DALLAS_SERVICE="$dir/bin/service" "$BATS_TEST_DIRNAME/../podkop-dallas" "$@" 2>/dev/null
+	PATH="$dir/bin:$PATH" PODKOP_GEO_SECRETS="$dir/secrets" PODKOP_GEO_SERVICE="$dir/bin/service" "$BATS_TEST_DIRNAME/../podkop-geo" "$@" 2>/dev/null
 }
 
 links() {
 	grep '^podkop.main.urltest_proxy_links=' "$1/uci" | cut -d= -f2-
+}
+
+setting() {
+	grep -v "^$2=" "$1/uci" >"$1/uci.new"
+	echo "$2=$3" >>"$1/uci.new"
+	mv "$1/uci.new" "$1/uci"
 }

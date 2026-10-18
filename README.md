@@ -50,6 +50,8 @@ The free tier allows 45 requests per minute over plain HTTP. Every checked serve
 
 ## Install
 
+Run these commands on your computer from the cloned repository, not on the router. `scp` copies the files to the router and `ssh` runs the installer there, so the router needs neither git nor the repository.
+
 ```sh
 cp secrets.example secrets   # put your real subscription URLs here, it is gitignored
 router=root@<router_ip>      # your router address, e.g. root@192.168.1.1

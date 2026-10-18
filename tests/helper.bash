@@ -2,15 +2,15 @@ fixture() {
 	dir=$(mktemp -d "$BATS_TEST_TMPDIR/router.XXXXXX")
 	mkdir -p "$dir/bin" "$dir/sub" "$dir/geo" "$dir/dns"
 	: >"$dir/secrets"
-	printf "podkop_geo.location.name=usa\npodkop_geo.location.country=US\npodkop_geo.location.region=Texas\npodkop_geo.location.city=Dallas\n" >"$dir/uci"
+	printf "podkop_geo.location.name=usa\npodkop_geo.location.country=US\npodkop_geo.location.region=Texas\npodkop_geo.location.city=Dallas\npodkop.main.mixed_proxy_enabled=1\n" >"$dir/uci"
 	echo 204 >"$dir/probe"
 	cat >"$dir/bin/curl" <<STUB
 #!/bin/sh
 for arg; do url=\$arg; done
 case "\$url" in
 	https://sub.test/*) [ -f "$dir/sub/\${url##*/}" ] || exit 22; out=; prev=; for arg; do [ "\$prev" = -o ] && out=\$arg; prev=\$arg; done; cat "$dir/sub/\${url##*/}" >"\$out" ;;
-	http://ip-api.com/line/*) ip=\${url#http://ip-api.com/line/}; cat "$dir/geo/\${ip%%\?*}" 2>/dev/null || printf 'fail\n' ;;
-	*) cat "$dir/probe" ;;
+	http://ip-api.com/line/*) echo "\$url" >>"$dir/geocalls"; ip=\${url#http://ip-api.com/line/}; cat "$dir/geo/\${ip%%\?*}" 2>/dev/null || printf 'fail\n' ;;
+	*) prev=; for arg; do [ "\$prev" = -x ] && echo "\$arg" >>"$dir/proxies"; prev=\$arg; done; cat "$dir/probe" ;;
 esac
 STUB
 	cat >"$dir/bin/nslookup" <<STUB
@@ -23,15 +23,14 @@ STUB
 #!/bin/sh
 [ "\$1" = -q ] && shift
 case "\$1" in
-	get) grep "^\$2=" "$dir/uci" | cut -d= -f2- | tr '\n' ' ' | sed 's/ \$//'; echo ;;
+	get) grep -q "^\$2=" "$dir/uci" || exit 1; grep "^\$2=" "$dir/uci" | cut -d= -f2- | tr '\n' ' ' | sed 's/ \$//'; echo ;;
 	delete) grep -v "^\$2=" "$dir/uci" >"$dir/uci.new"; mv "$dir/uci.new" "$dir/uci" ;;
 	add_list) echo "\$2" >>"$dir/uci" ;;
 	set) grep -v "^\${2%%=*}=" "$dir/uci" >"$dir/uci.new"; echo "\$2" >>"$dir/uci.new"; mv "$dir/uci.new" "$dir/uci" ;;
 esac
 STUB
 	printf '#!/bin/sh\necho restart >>"%s/restarts"\n' "$dir" >"$dir/bin/service"
-	printf '#!/bin/sh\n' >"$dir/bin/logger"
-	printf '#!/bin/sh\n' >"$dir/bin/lock"
+	printf '#!/bin/sh\necho "$*" >>"%s/log"\n' "$dir" >"$dir/bin/logger"
 	chmod +x "$dir"/bin/*
 	echo "$dir"
 }
@@ -53,7 +52,7 @@ link() {
 tool() {
 	dir=$1
 	shift
-	PATH="$dir/bin:$PATH" PODKOP_GEO_SECRETS="$dir/secrets" PODKOP_GEO_SERVICE="$dir/bin/service" "$BATS_TEST_DIRNAME/../podkop-geo" "$@" 2>/dev/null
+	PATH="$dir/bin:$PATH" PODKOP_GEO_SECRETS="$dir/secrets" PODKOP_GEO_SERVICE="$dir/bin/service" PODKOP_GEO_LOCK="$dir/lock.pid" PODKOP_GEO_STATE="$dir/state" "$BATS_TEST_DIRNAME/../podkop-geo" "$@" 2>/dev/null
 }
 
 links() {

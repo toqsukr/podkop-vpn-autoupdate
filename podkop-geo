@@ -4,6 +4,8 @@ SERVICE="${PODKOP_GEO_SERVICE:-/etc/init.d/podkop}"
 RESOLVER="${PODKOP_GEO_RESOLVER:-$(uci -q get podkop.settings.bootstrap_dns_server || echo 77.88.8.8)}"
 PORT="${PODKOP_GEO_PORT:-$(uci -q get podkop.main.mixed_proxy_port || echo 2080)}"
 PROBE="${PODKOP_GEO_PROBE:-https://www.gstatic.com/generate_204}"
+LOCK="${PODKOP_GEO_LOCK:-/var/lock/podkop-geo.pid}"
+STATE="${PODKOP_GEO_STATE:-/tmp/podkop-geo}"
 NAME="$(uci -q get podkop_geo.location.name)"
 COUNTRY="$(uci -q get podkop_geo.location.country)"
 REGION="$(uci -q get podkop_geo.location.region)"
@@ -38,15 +40,21 @@ decoded() {
 
 links() {
 	body=$(mktemp)
+	number=0
 	subscriptions | while read -r url; do
-		curl -s -f -L --compressed -m 20 -o "$body" "$url" || { say "Subscription ${url%%\?*} failed to download"; continue; }
+		number=$((number + 1))
+		curl -s -f -L --compressed -m 20 -o "$body" "$url" || { say "Subscription #$number failed to download with curl exit $?"; continue; }
 		decoded "$body" | tr -d '\r' | grep '^vless://'
 	done
 	rm -f "$body"
 }
 
 named() {
-	if [ -n "$NAME" ]; then grep -i -E "#.*($NAME)"; else cat; fi
+	if [ -n "$NAME" ]; then
+		LC_ALL=C awk '{ name = index($0, "#") ? substr($0, index($0, "#") + 1) : ""; out = ""; while (match(name, /%[0-9A-Fa-f][0-9A-Fa-f]/)) { out = out substr(name, 1, RSTART - 1) sprintf("%c", index("0123456789abcdef", tolower(substr(name, RSTART + 1, 1))) * 16 + index("0123456789abcdef", tolower(substr(name, RSTART + 2, 1))) - 17); name = substr(name, RSTART + 3) } print out name "\t" $0 }' | grep -i -E "^[^	]*($NAME)" | cut -f 2-
+	else
+		cat
+	fi
 }
 
 host() {
@@ -62,7 +70,14 @@ address() {
 }
 
 location() {
-	curl -s -m 10 "http://ip-api.com/line/$1?fields=status,countryCode,regionName,city" | tr -d '\r' | tr '\n' '|'
+	cache="$STATE/geo/$1"
+	if [ -n "$(find "$cache" -mmin -1440 2>/dev/null)" ]; then
+		cat "$cache"
+	else
+		place=$(curl -s -m 10 "http://ip-api.com/line/$1?fields=status,countryCode,regionName,city" | tr -d '\r' | tr '\n' '|')
+		case "$place" in success\|*) mkdir -p "$STATE/geo" && echo "$place" >"$cache" ;; esac
+		echo "$place"
+	fi
 }
 
 candidates() {
@@ -76,22 +91,18 @@ candidates() {
 }
 
 matching() {
-	awk -F '\t' -v country="$COUNTRY" -v field="$1" -v value="$2" '{ split(tolower($1), p, "|") } p[1] == "success" && (country == "" || p[2] == tolower(country)) && (value == "" || p[field] == tolower(value)) { print $2 }'
+	awk -F '\t' -v country="$COUNTRY" -v region="$REGION" -v city="$CITY" '{ split(tolower($1), p, "|") } p[1] == "success" && (country == "" || p[2] == tolower(country)) && (region == "" || p[3] == tolower(region)) && (city == "" || p[4] == tolower(city)) { print $2 }'
 }
 
 servers() {
-	[ -n "$COUNTRY$REGION$CITY" ] || fail "Location is not set, configure podkop_geo.location with uci"
-	pool=$(candidates)
-	chosen=
-	[ -n "$CITY" ] && chosen=$(printf '%s\n' "$pool" | matching 4 "$CITY")
-	[ -n "$chosen" ] || [ -z "$REGION" ] || chosen=$(printf '%s\n' "$pool" | matching 3 "$REGION")
-	[ -n "$chosen" ] || [ -n "$CITY$REGION" ] || chosen=$(printf '%s\n' "$pool" | matching 2 "")
+	[ -n "$COUNTRY$REGION$CITY" ] || fail "Location is not set, fill podkop_geo.conf and run deploy.sh"
+	chosen=$(candidates | matching)
 	[ -n "$chosen" ] || fail "No server in $TARGET was found across subscriptions"
 	echo "$chosen"
 }
 
 apply() {
-	[ "$(uci -q get "$OPTION")" = "$(echo "$1" | tr '\n' ' ' | sed 's/ $//')" ] && { say "Podkop already uses the current servers in $TARGET"; return 0; }
+	[ "$(uci -q get "$OPTION" | tr ' ' '\n' | sort)" = "$(echo "$1" | sort)" ] && { say "Podkop already uses the current servers in $TARGET"; return 0; }
 	uci -q delete "$OPTION"
 	echo "$1" | while read -r link; do uci add_list "$OPTION=$link"; done
 	uci set podkop.main.proxy_config_type=urltest
@@ -100,11 +111,17 @@ apply() {
 	say "Podkop switched to $(echo "$1" | wc -l | tr -d ' ') servers in $TARGET"
 }
 
+hold() {
+	[ -f "$LOCK" ] && kill -0 "$(cat "$LOCK")" 2>/dev/null && fail "Another update is running as pid $(cat "$LOCK")"
+	echo $$ >"$LOCK"
+	trap 'rm -f "$LOCK"' EXIT
+}
+
 update() {
-	lock /var/lock/podkop-geo
-	list=$(servers) || { lock -u /var/lock/podkop-geo; exit 1; }
+	hold
+	mkdir -p "$STATE" && touch "$STATE/updated"
+	list=$(servers) || exit 1
 	apply "$list"
-	lock -u /var/lock/podkop-geo
 }
 
 alive() {
@@ -116,7 +133,10 @@ alive() {
 }
 
 check() {
-	alive || update
+	[ "$(uci -q get podkop.main.mixed_proxy_enabled)" = 1 ] || fail "Mixed proxy is disabled in podkop, health check cannot run"
+	alive && return 0
+	[ -n "$(find "$STATE/updated" -mmin -30 2>/dev/null)" ] && { say "Skipping update, the previous one ran less than 30 minutes ago"; return 0; }
+	update
 }
 
 case "$1" in

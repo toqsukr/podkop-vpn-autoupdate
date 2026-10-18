@@ -60,14 +60,13 @@ load helper
 	[ "$(links "$dir" | grep -c ny.example)" = 0 ] || { echo "new york server was not skipped"; false; }
 }
 
-@test "falls back to texas region" {
+@test "rejects texas server outside dallas" {
 	dir=$(fixture)
 	host="t$RANDOM.example"
-	texas=$(link "$host" "USA")
 	server "$dir" "$host" 10.6.6.6 US Texas Irving
-	echo "$texas" | subscription "$dir" a
-	tool "$dir" update
-	[ "$(links "$dir")" = "$texas" ] || { echo "texas server was not used as fallback"; false; }
+	link "$host" "USA" | subscription "$dir" a
+	run tool "$dir" update
+	[ "$status" -ne 0 ] || { echo "server outside configured city was accepted"; false; }
 }
 
 @test "keeps config when dallas is missing" {
@@ -200,4 +199,128 @@ load helper
 	link "$host" "USA" | subscription "$dir" a
 	run tool "$dir" update
 	[ "$status" -ne 0 ] || { echo "missing location did not fail"; false; }
+}
+
+@test "dont log subscription url" {
+	dir=$(fixture)
+	token="tok$RANDOM$RANDOM"
+	echo "https://sub.test/sub/$token" >>"$dir/secrets"
+	host="l$RANDOM.example"
+	server "$dir" "$host" 10.8.1.1 US Texas Dallas
+	link "$host" "USA" | subscription "$dir" a
+	tool "$dir" update
+	[ "$(grep -c "$token" "$dir/log")" = 0 ] || { echo "subscription token leaked into the log"; false; }
+}
+
+@test "refuses update while another one runs" {
+	dir=$(fixture)
+	echo $$ >"$dir/lock.pid"
+	host="k$RANDOM.example"
+	server "$dir" "$host" 10.8.2.2 US Texas Dallas
+	link "$host" "USA" | subscription "$dir" a
+	run tool "$dir" update
+	[ "$status" -ne 0 ] || { echo "concurrent update was not refused"; false; }
+}
+
+@test "ignores lock left by dead process" {
+	dir=$(fixture)
+	sh -c 'exit 0' &
+	dead=$!
+	wait "$dead"
+	echo "$dead" >"$dir/lock.pid"
+	host="j$RANDOM.example"
+	dallas=$(link "$host" "USA")
+	server "$dir" "$host" 10.8.3.3 US Texas Dallas
+	echo "$dallas" | subscription "$dir" a
+	tool "$dir" update
+	[ "$(links "$dir")" = "$dallas" ] || { echo "stale lock blocked the update"; false; }
+}
+
+@test "reuses cached geolocation" {
+	dir=$(fixture)
+	host="h$RANDOM.example"
+	server "$dir" "$host" 10.8.4.4 US Texas Dallas
+	link "$host" "USA" | subscription "$dir" a
+	tool "$dir" update
+	tool "$dir" update
+	[ "$(wc -l <"$dir/geocalls" | tr -d ' ')" = 1 ] || { echo "geolocation was requested again despite cache"; false; }
+}
+
+@test "dont cache failed geolocation" {
+	dir=$(fixture)
+	host="f$RANDOM.example"
+	echo "Address: 10.8.5.5" >"$dir/dns/$host"
+	link "$host" "USA" | subscription "$dir" a
+	tool "$dir" update || true
+	tool "$dir" update || true
+	[ "$(wc -l <"$dir/geocalls" | tr -d ' ')" = 2 ] || { echo "failed geolocation was cached"; false; }
+}
+
+@test "check pauses after recent update" {
+	dir=$(fixture)
+	echo 000 >"$dir/probe"
+	mkdir -p "$dir/state"
+	touch "$dir/state/updated"
+	host="p$RANDOM.example"
+	server "$dir" "$host" 10.8.6.6 US Texas Dallas
+	link "$host" "USA" | subscription "$dir" a
+	tool "$dir" check || true
+	[ -z "$(links "$dir")" ] || { echo "check updated right after previous update"; false; }
+}
+
+@test "manual update ignores pause" {
+	dir=$(fixture)
+	mkdir -p "$dir/state"
+	touch "$dir/state/updated"
+	host="m$RANDOM.example"
+	dallas=$(link "$host" "USA")
+	server "$dir" "$host" 10.8.7.7 US Texas Dallas
+	echo "$dallas" | subscription "$dir" a
+	tool "$dir" update
+	[ "$(links "$dir")" = "$dallas" ] || { echo "manual update was paused"; false; }
+}
+
+@test "matches cyrillic name in encoded fragment" {
+	dir=$(fixture)
+	setting "$dir" podkop_geo.location.name "США"
+	host="y$RANDOM.example"
+	dallas=$(link "$host" "%F0%9F%87%BA%F0%9F%87%B8%20%D0%A1%D0%A8%D0%90")
+	server "$dir" "$host" 10.8.8.1 US Texas Dallas
+	echo "$dallas" | subscription "$dir" a
+	tool "$dir" update
+	[ "$(links "$dir")" = "$dallas" ] || { echo "encoded cyrillic name was not matched"; false; }
+}
+
+@test "check refuses when mixed proxy is disabled" {
+	dir=$(fixture)
+	setting "$dir" podkop.main.mixed_proxy_enabled 0
+	echo 000 >"$dir/probe"
+	run tool "$dir" check
+	[ "$status" -ne 0 ] || { echo "check ran without mixed proxy"; false; }
+}
+
+@test "dont restart podkop when only order differs" {
+	dir=$(fixture)
+	{ link o1.example "USA"; link o2.example "USA"; } >"$dir/pair"
+	subscription "$dir" a <"$dir/pair"
+	server "$dir" o1.example 10.8.9.1 US Texas Dallas
+	server "$dir" o2.example 10.8.9.2 US Texas Dallas
+	sort -r "$dir/pair" | sed 's/^/podkop.main.urltest_proxy_links=/' >>"$dir/uci"
+	tool "$dir" update
+	[ ! -f "$dir/restarts" ] || { echo "podkop was restarted for reordered links"; false; }
+}
+
+@test "falls back to yandex dns without bootstrap setting" {
+	dir=$(fixture)
+	host="v$RANDOM.example"
+	server "$dir" "$host" 10.9.0.1 US Texas Dallas
+	link "$host" "USA" | subscription "$dir" a
+	tool "$dir" update
+	[ "$(sort -u "$dir/resolvers")" = 77.88.8.8 ] || { echo "default resolver was not used"; false; }
+}
+
+@test "probes default port without port setting" {
+	dir=$(fixture)
+	tool "$dir" check
+	[ "$(sort -u "$dir/proxies")" = socks5h://127.0.0.1:2080 ] || { echo "default mixed proxy port was not probed"; false; }
 }

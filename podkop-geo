@@ -5,13 +5,16 @@ RESOLVER="${PODKOP_GEO_RESOLVER:-$(uci -q get podkop.settings.bootstrap_dns_serv
 PORT="${PODKOP_GEO_PORT:-$(uci -q get podkop.main.mixed_proxy_port || echo 2080)}"
 PROBE="${PODKOP_GEO_PROBE:-https://www.gstatic.com/generate_204}"
 LOCK="${PODKOP_GEO_LOCK:-/var/lock/podkop-geo.pid}"
-STATE="${PODKOP_GEO_STATE:-/tmp/podkop-geo}"
+STATE="${PODKOP_GEO_STATE:-/var/run/podkop-geo}"
+TRIAL="${PODKOP_GEO_TRIAL:-20808}"
 NAME="$(uci -q get podkop_geo.location.name)"
 COUNTRY="$(uci -q get podkop_geo.location.country)"
 REGION="$(uci -q get podkop_geo.location.region)"
 CITY="$(uci -q get podkop_geo.location.city)"
+EXCLUDE="$(uci -q get podkop_geo.location.exclude)"
 TARGET="$(echo "$CITY, $REGION, $COUNTRY" | sed -e 's/^[, ]*//' -e 's/[, ]*$//' -e 's/, , /, /')"
 OPTION=podkop.main.urltest_proxy_links
+DECODE='function decode(s, out) { out = ""; while (match(s, /%[0-9A-Fa-f][0-9A-Fa-f]/)) { out = out substr(s, 1, RSTART - 1) sprintf("%c", index("0123456789abcdef", tolower(substr(s, RSTART + 1, 1))) * 16 + index("0123456789abcdef", tolower(substr(s, RSTART + 2, 1))) - 17); s = substr(s, RSTART + 3) } return out s }'
 
 say() {
 	logger -t podkop-geo "$*"
@@ -29,7 +32,7 @@ subscriptions() {
 }
 
 decoded() {
-	if [ "$(head -c 2 "$1" | od -A n -t x1 | tr -d ' ')" = 1f8b ]; then
+	if gzip -t "$1" 2>/dev/null; then
 		gzip -dc "$1"
 	elif grep -q '://' "$1"; then
 		cat "$1"
@@ -44,17 +47,21 @@ links() {
 	subscriptions | while read -r url; do
 		number=$((number + 1))
 		curl -s -f -L --compressed -m 20 -o "$body" "$url" || { say "Subscription #$number failed to download with curl exit $?"; continue; }
-		decoded "$body" | tr -d '\r' | grep '^vless://'
+		decoded "$body" | tr -d '\r' | grep '^vless://' | sed 's/ /%20/g'
 	done
 	rm -f "$body"
 }
 
 named() {
 	if [ -n "$NAME" ]; then
-		LC_ALL=C awk '{ name = index($0, "#") ? substr($0, index($0, "#") + 1) : ""; out = ""; while (match(name, /%[0-9A-Fa-f][0-9A-Fa-f]/)) { out = out substr(name, 1, RSTART - 1) sprintf("%c", index("0123456789abcdef", tolower(substr(name, RSTART + 1, 1))) * 16 + index("0123456789abcdef", tolower(substr(name, RSTART + 2, 1))) - 17); name = substr(name, RSTART + 3) } print out name "\t" $0 }' | grep -i -E "^[^	]*($NAME)" | cut -f 2-
+		LC_ALL=C awk "$DECODE"' { print decode(index($0, "#") ? substr($0, index($0, "#") + 1) : "") "\t" $0 }' | grep -i -E "^[^	]*($NAME)" | cut -f 2-
 	else
 		cat
 	fi
+}
+
+allowed() {
+	awk -v exclude="$EXCLUDE" '{ query = $0; sub(/#.*/, "", query); query = index(query, "?") ? "&" substr(query, index(query, "?") + 1) "&" : ""; count = split(exclude, rules, " "); for (i = 1; i <= count; i++) if (index(query, "&" rules[i] "&")) next; print }'
 }
 
 host() {
@@ -69,24 +76,83 @@ address() {
 	fi
 }
 
+config() {
+	echo "$1" | LC_ALL=C awk -v ip="$2" -v trial="$TRIAL" "$DECODE"'
+		function quote(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return "\"" s "\"" }
+		{
+			link = $0; sub(/#.*/, "", link); sub(/^vless:\/\//, "", link)
+			uuid = decode(substr(link, 1, index(link, "@") - 1)); rest = substr(link, index(link, "@") + 1)
+			query = index(rest, "?") ? substr(rest, index(rest, "?") + 1) : ""; sub(/[?\/].*/, "", rest)
+			port = rest; sub(/.*:/, "", port); if (port !~ /^[0-9]+$/) port = 443
+			host = rest; sub(/:[0-9]*$/, "", host); gsub(/[][]/, "", host)
+			count = split(query, pairs, "&")
+			for (i = 1; i <= count; i++) q[substr(pairs[i], 1, index(pairs[i] "=", "=") - 1)] = decode(substr(pairs[i], index(pairs[i] "=", "=") + 1))
+			type = q["type"] == "" ? "tcp" : q["type"]
+			if (type == "tcp" || type == "raw") transport = ""
+			else if (type == "ws") transport = ",\"transport\":{\"type\":\"ws\",\"path\":" quote(q["path"] == "" ? "/" : q["path"]) ",\"headers\":{\"Host\":" quote(q["host"] == "" ? host : q["host"]) "}}"
+			else if (type == "httpupgrade") transport = ",\"transport\":{\"type\":\"httpupgrade\",\"path\":" quote(q["path"] == "" ? "/" : q["path"]) ",\"host\":" quote(q["host"] == "" ? host : q["host"]) "}"
+			else if (type == "grpc") transport = ",\"transport\":{\"type\":\"grpc\",\"service_name\":" quote(q["serviceName"]) "}"
+			else exit 3
+			tls = ""
+			if (q["security"] == "tls" || q["security"] == "reality") {
+				tls = ",\"tls\":{\"enabled\":true,\"server_name\":" quote(q["sni"] == "" ? host : q["sni"])
+				if (q["fp"] != "") tls = tls ",\"utls\":{\"enabled\":true,\"fingerprint\":" quote(q["fp"]) "}"
+				if (q["alpn"] != "") { gsub(/,/, "\",\"", q["alpn"]); tls = tls ",\"alpn\":[\"" q["alpn"] "\"]" }
+				if (q["security"] == "reality") tls = tls ",\"reality\":{\"enabled\":true,\"public_key\":" quote(q["pbk"]) ",\"short_id\":" quote(q["sid"]) "}"
+				tls = tls "}"
+			}
+			flow = q["flow"] == "" ? "" : ",\"flow\":" quote(q["flow"])
+			printf "{\"log\":{\"level\":\"error\"},\"inbounds\":[{\"type\":\"mixed\",\"listen\":\"127.0.0.1\",\"listen_port\":%d}],\"outbounds\":[{\"type\":\"vless\",\"server\":%s,\"server_port\":%d,\"uuid\":%s%s%s%s}]}\n", trial, quote(ip), port, quote(uuid), flow, tls, transport
+		}'
+}
+
+trial() {
+	config "$1" "$2" >"$STATE/trial.json" || { say "Link to $(host "$1") uses an unsupported transport"; return 0; }
+	sing-box run -c "$STATE/trial.json" >/dev/null 2>&1 &
+	pid=$!
+	for attempt in 1 2 3 4 5; do
+		place=$(curl -s -m 10 -x "socks5h://127.0.0.1:$TRIAL" "http://ip-api.com/line?fields=status,countryCode,regionName,city") && break
+		sleep 1
+	done
+	kill "$pid" 2>/dev/null
+	wait "$pid" 2>/dev/null
+	rm -f "$STATE/trial.json"
+	echo "$place" | tr -d '\r' | tr '\n' '|'
+}
+
+pinned() {
+	echo "$1" | awk -v ip="$2" '{
+		head = substr($0, 1, index($0, "@")); rest = substr($0, index($0, "@") + 1)
+		end = match(rest, /[\/?#]/) ? RSTART : length(rest) + 1
+		name = substr(rest, 1, end - 1); port = match(name, /:[0-9]*$/) ? substr(name, RSTART) : ""; name = substr(name, 1, length(name) - length(port))
+		tail = substr(rest, end); fragment = index(tail, "#") ? substr(tail, index(tail, "#")) : ""; tail = substr(tail, 1, length(tail) - length(fragment))
+		query = index(tail, "?") ? "&" substr(tail, index(tail, "?") + 1) "&" : "&"
+		extra = ""
+		if (query ~ /&security=(tls|reality)&/ && query !~ /&sni=[^&]/) extra = extra "&sni=" name
+		if (query ~ /&type=(ws|httpupgrade)&/ && query !~ /&host=[^&]/) extra = extra "&host=" name
+		if (extra != "") tail = index(tail, "?") ? tail extra : tail "?" substr(extra, 2)
+		print head ip port tail fragment
+	}'
+}
+
 location() {
-	cache="$STATE/geo/$1"
+	cache="$STATE/geo/$(echo "$1 $2" | md5sum | cut -c 1-32)"
 	if [ -n "$(find "$cache" -mmin -1440 2>/dev/null)" ]; then
 		cat "$cache"
 	else
-		place=$(curl -s -m 10 "http://ip-api.com/line/$1?fields=status,countryCode,regionName,city" | tr -d '\r' | tr '\n' '|')
+		place=$(trial "$1" "$2")
 		case "$place" in success\|*) mkdir -p "$STATE/geo" && echo "$place" >"$cache" ;; esac
 		echo "$place"
 	fi
 }
 
 candidates() {
-	links | awk '!seen[$0]++' | named | while read -r link; do
+	links | awk '!seen[$0]++' | named | allowed | while read -r link; do
 		ip=$(address "$(host "$link")")
 		[ -n "$ip" ] || { say "Host $(host "$link") did not resolve"; continue; }
-		place=$(location "$ip")
-		say "Candidate $(host "$link") at $ip is located in $place"
-		printf '%s\t%s\n' "$place" "$link"
+		place=$(location "$link" "$ip")
+		say "Candidate $(host "$link") at $ip exits in $place"
+		printf '%s\t%s\n' "$place" "$(pinned "$link" "$ip")"
 	done
 }
 
@@ -119,7 +185,7 @@ hold() {
 
 update() {
 	hold
-	mkdir -p "$STATE" && touch "$STATE/updated"
+	mkdir -p -m 700 "$STATE" && touch "$STATE/updated"
 	list=$(servers) || exit 1
 	apply "$list"
 }
@@ -132,9 +198,17 @@ alive() {
 	return 1
 }
 
+present() {
+	place=$(curl -s -m 10 -x "socks5h://127.0.0.1:$PORT" "http://ip-api.com/line?fields=status,countryCode,regionName,city" | tr -d '\r' | tr '\n' '|')
+	[ -n "$(printf '%s\tpresent\n' "$place" | matching)" ] && return 0
+	say "Podkop exits in $place outside $TARGET"
+	rm -rf "$STATE/geo"
+	return 1
+}
+
 check() {
 	[ "$(uci -q get podkop.main.mixed_proxy_enabled)" = 1 ] || fail "Mixed proxy is disabled in podkop, health check cannot run"
-	alive && return 0
+	alive && present && return 0
 	[ -n "$(find "$STATE/updated" -mmin -30 2>/dev/null)" ] && { say "Skipping update, the previous one ran less than 30 minutes ago"; return 0; }
 	update
 }
